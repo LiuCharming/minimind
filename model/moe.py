@@ -69,7 +69,7 @@ class MoEConfig:
     gate_norm_std: float = 1.0            # logits norm 目标标准差
 
     # ── 负载均衡 ──
-    balance_loss_weight: float = 1.0      # 均衡损失总权重
+    balance_loss_weight: float = 0.01     # 均衡损失总权重 (用CV²时建议1e-3~1e-2)
     tau: float = 0.75                     # ZeroExpert 负载权重 η
     use_normalized_loss: bool = True      # True=CV² 损失, False=Switch Transformer 损失
 
