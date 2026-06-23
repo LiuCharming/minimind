@@ -51,6 +51,7 @@ def main():
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
+    parser.add_argument('--show_moe_stats', default=0, type=int, choices=[0, 1], help="显示MoE V2各层专家利用率分布")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     
@@ -83,6 +84,10 @@ def main():
         
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
+        # MoE V2 专家均衡统计
+        if args.show_moe_stats:
+            model.reset_moe_stats()
+
         print('🧠: ', end='')
         st = time.time()
         generated_ids = model.generate(
@@ -95,6 +100,28 @@ def main():
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
+
+        if args.show_moe_stats:
+            moe_stats = model.get_moe_stats()
+            if moe_stats:
+                print('━' * 55)
+                print(f'[MoE Stats] 各层专家平均利用率 (共 {gen_tokens} tokens)')
+                num_experts = len(next(iter(moe_stats.values())))
+                # 表头
+                header = f'  Expert | ' + ' | '.join([f'L{lid:02d}  ' for lid in sorted(moe_stats.keys())]) + ' |  Avg  '
+                print(header)
+                print('-' * len(header))
+                # 每行一个专家
+                avg_util = torch.stack(list(moe_stats.values())).mean(dim=0)
+                for ei in range(num_experts):
+                    row = f'  E{ei:02d}    | '
+                    for lid in sorted(moe_stats.keys()):
+                        row += f'{moe_stats[lid][ei].item()*100:4.1f}% | '
+                    row += f'{avg_util[ei].item()*100:4.1f}%'
+                    print(row)
+                print('━' * 55)
+            else:
+                print('[MoE Stats] 无 MoE V2 层，跳过统计')
 
 if __name__ == "__main__":
     main()

@@ -212,14 +212,41 @@ class MOEFeedForwardV2(nn.Module):
         )
         self.moe_block = MoEBlock(moe_config)
         self.aux_loss = torch.zeros(1).squeeze()
+        self._expert_util_sum = None
+        self._expert_util_cnt = 0
 
     def forward(self, x):
         # gate_residual 跨层传播需要模型级改动(逐层传递gate), 这里作为drop-in替换不启用
-        out, _, balance_loss, _ = self.moe_block(
+        out, _, balance_loss, expert_util = self.moe_block(
             x, gate_residual=None, compute_loss=self.training
         )
         self.aux_loss = balance_loss
+        # 累积专家利用率 (训练/推理通用)
+        if self._expert_util_sum is None:
+            self._expert_util_sum = expert_util.detach().clone()
+        else:
+            self._expert_util_sum += expert_util.detach()
+        self._expert_util_cnt += 1
+        # debug: 每100次前向打印一次专家利用率
+        if self.training and not hasattr(self, '_debug_cnt'):
+            self._debug_cnt = 0
+        if self.training:
+            self._debug_cnt += 1
+            if self._debug_cnt % 100 == 1:
+                util_str = ' '.join([f'e{i}:{v:.3f}' for i, v in enumerate(expert_util)])
+                print(f'[MoE Debug] aux_loss={balance_loss.item():.6f} expert_util=[{util_str}]')
         return out
+
+    def reset_moe_stats(self):
+        """重置专家利用率的累积统计"""
+        self._expert_util_sum = None
+        self._expert_util_cnt = 0
+
+    def get_moe_stats(self):
+        """返回平均专家利用率 [num_experts]"""
+        if self._expert_util_sum is None or self._expert_util_cnt == 0:
+            return None
+        return (self._expert_util_sum / self._expert_util_cnt).cpu()
 
 
 class MiniMindBlock(nn.Module):
@@ -303,6 +330,22 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+
+    def reset_moe_stats(self):
+        """重置所有 V2 MoE 层的专家利用率统计"""
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, MOEFeedForwardV2):
+                layer.mlp.reset_moe_stats()
+
+    def get_moe_stats(self):
+        """返回每层专家利用率 {layer_id: tensor[num_experts]}"""
+        stats = {}
+        for i, layer in enumerate(self.model.layers):
+            if isinstance(layer.mlp, MOEFeedForwardV2):
+                s = layer.mlp.get_moe_stats()
+                if s is not None:
+                    stats[i] = s
+        return stats
     
     # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()

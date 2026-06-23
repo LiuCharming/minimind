@@ -565,6 +565,14 @@ MiniMind训练数据集下载地址： [ModelScope](https://www.modelscope.cn/da
 * 当前默认配置为 `4 experts / top-1 routing`，用于以更低激活参数获得更高容量。
 * Experts 继续增加后，实际耗时往往比同尺寸规模的 dense 模型高非常多，这和 “MoE 推理更快” 放在一起看会有点反直觉，但训练时 token 先按专家分桶、再分别做 forward，原生训练时带来的 `kernel` 启停和调度开销会急剧变重，这本身是很自然的事情。得靠支持 MoE kernel-fused 的算子库来优化，比如基于 `Triton` 的自定义 kernel、`DeepSpeed-MoE`、`Megatron-LM` 等等。当然，这个项目还是希望保留原生 PyTorch 的普适性，所以这里做的是现实的折中，在当前实现下，`4 experts / top-1` 这个甜点配置大约只比 dense 模型慢 `50%` 左右。
 
+**MoE V2 模块**（独立可插拔，`moe_type='v2'`）：
+从 `language_model_moe.py` 提取的独立 MoE 系统（`model/moe.py`），与原有 V1 MoE 通过 `moe_type` 配置切换。相比 V1，V2 默认使用：
+* 6 专家结构：`2 FFN + 2 Constant + 1 Copy + 1 Zero`，训练/推理时只激活 top-1 专家
+* Mixtral 风格 gating（top-k logits softmax），CV² 负载均衡损失
+* 张量化路由：按专家预先排序 token → 分段批处理 → `index_add_` 聚合，避免 for 循环
+* 可插拔设计：不依赖项目其他代码，仅需 `torch`，可直接复用到其他项目
+* V2 专用 CLI 参数：`--moe_type v2` `--num_experts 6` `--num_experts_per_tok 1`
+
 `minimind-3` 系列结构如下图：
 
 ![structure](./images/LLM-structure.jpg)
@@ -575,7 +583,8 @@ MiniMind训练数据集下载地址： [ModelScope](https://www.modelscope.cn/da
 | Model Name | params | len_vocab | max_pos | rope_theta | n_layers | d_model | kv_heads | q_heads | note |
 |------------|--------|-----------|---------|------------|----------|---------|----------|---------|------|
 | minimind-3 | 64M | 6400 | 32768 | 1e6 | 8 | 768 | 4 | 8 | Dense |
-| minimind-3-moe | 198M-A64M | 6400 | 32768 | 1e6 | 8 | 768 | 4 | 8 | 4 experts / top-1 |
+| minimind-3-moe | 198M-A64M | 6400 | 32768 | 1e6 | 8 | 768 | 4 | 8 | 4 experts / top-1 (V1) |
+| minimind-3-moe-v2 | ~60M-A15M | 6400 | 32768 | 1e6 | 8 | 768 | 4 | 8 | 6 experts / top-1 (V2) |
 | minimind2-small | 26M | 6400 | 32768 | 1e6 | 8 | 512 | 2 | 8 | 历史版本 |
 | minimind2-moe | 145M | 6400 | 32768 | 1e6 | 8 | 640 | 2 | 8 | 历史版本 |
 | minimind2 | 104M | 6400 | 32768 | 1e6 | 16 | 768 | 2 | 8 | 历史版本 |
@@ -676,11 +685,42 @@ LLM 首先要学会的是先把尽可能多的基础知识和语言规律吸收�
 更直白地说，模型在这一阶段的核心目标就是**学会高质量地词语接龙**。例如输入“秦始皇”，它要能够继续生成“是中国历史上的第一位皇帝”这类符合语义与常识的后续内容。
 
 ```bash
-# 方式1
+# 方式1: dense 模型（默认）
 torchrun --nproc_per_node 1 train_pretrain.py # 1即为单卡训练，可根据硬件情况自行调整 (设置>=2)
 # 方式2
 python train_pretrain.py
 ```
+
+<details>
+<summary>使用 MoE V2 预训练（点击展开）</summary>
+
+```bash
+# V2 MoE 预训练（6 专家 / top-1 / 全尺寸 FFN）
+python train_pretrain.py --use_moe 1 --moe_type v2 --num_experts 6 --num_experts_per_tok 1
+# V1 MoE 预训练（4 专家 / top-1）
+python train_pretrain.py --use_moe 1 --moe_type v1 --num_experts 4 --num_experts_per_tok 1
+```
+
+V2 MoE 相关 CLI 参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--moe_type` | `v1` | MoE 类型（`v1`=原始 V1 / `v2`=独立 MoEBlock） |
+| `--num_experts` | `4` | 专家总数（V2 默认 6，V1 默认 4） |
+| `--num_experts_per_tok` | `1` | 每个 token 激活的专家数（top-k） |
+
+V2 也支持通过 `MiniMindConfig` 传入以下参数：
+* `moe_balance_loss_weight` (默认 `0.01`)：CV² 负载均衡损失权重
+* `moe_expert_intermediate_ratio` (默认 `1.0`)：专家 FFN 相对 Dense MLP 的宽度比例
+* `moe_use_mixtral_gating` (默认 `True`)：是否使用 Mixtral 风格 gating
+* `moe_use_2layer_gate` (默认 `False`)：是否使用双层 gate 网络
+
+推理测试：
+```bash
+python eval_llm.py --use_moe 1 --moe_type v2 --num_experts 6 --weight pretrain --show_moe_stats 1
+```
+
+</details>
 
 > 训练后的模型权重文件默认每隔`save_interval步`保存为:`pretrain_*.pth`（*为模型具体dimension，每次保存时新文件会覆盖旧文件）
 
