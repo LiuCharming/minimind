@@ -22,6 +22,8 @@ def init_model(args):
             moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio,
             use_moh=bool(args.use_moh),
             moh_shared_heads=args.moh_shared_heads,
+            moh_routed_head=args.moh_routed_head,
+            num_attention_heads=args.num_attention_heads,
             inference_rope_scaling=args.inference_rope_scaling
         ))
         moe_suffix = '_moe' if args.use_moe else ''
@@ -58,6 +60,8 @@ def main():
     parser.add_argument('--show_moe_stats', default=0, type=int, choices=[0, 1], help="显示MoE V2各层专家利用率分布")
     parser.add_argument('--use_moh', default=0, type=int, choices=[0, 1], help="是否使用MoH(Mixture-of-Heads)注意力")
     parser.add_argument('--moh_shared_heads', default=4, type=int, help="MoH始终激活的Q头数")
+    parser.add_argument('--moh_routed_head', default=1, type=int, help="MoH每个token激活的专家Q头数(top-k)")
+    parser.add_argument('--num_attention_heads', default=8, type=int, help="Q头总数（需为KV头数的整数倍）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     

@@ -107,6 +107,8 @@ if __name__ == "__main__":
     parser.add_argument('--moe_expert_intermediate_ratio', default=0.5, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
     parser.add_argument('--use_moh', default=0, type=int, choices=[0, 1], help="是否使用MoH(Mixture-of-Heads)注意力路由")
     parser.add_argument('--moh_shared_heads', default=4, type=int, help="MoH始终激活的Q头数")
+    parser.add_argument('--moh_routed_head', default=1, type=int, help="MoH每个token激活的专家Q头数(top-k)")
+    parser.add_argument('--num_attention_heads', default=8, type=int, help="Q头总数（需为KV头数的整数倍）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -125,7 +127,9 @@ if __name__ == "__main__":
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe),
                                moe_type=args.moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok,
                                moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio,
-                               use_moh=bool(args.use_moh), moh_shared_heads=args.moh_shared_heads)
+                               use_moh=bool(args.use_moh), moh_shared_heads=args.moh_shared_heads,
+                               moh_routed_head=args.moh_routed_head,
+                               num_attention_heads=args.num_attention_heads)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
