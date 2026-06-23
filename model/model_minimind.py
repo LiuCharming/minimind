@@ -49,6 +49,11 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_use_2layer_gate = kwargs.get("moe_use_2layer_gate", False)
         self.moe_balance_loss_weight = kwargs.get("moe_balance_loss_weight", 0.01)
         self.moe_expert_intermediate_ratio = kwargs.get("moe_expert_intermediate_ratio", 1.0)
+        # MoH config
+        self.use_moh = kwargs.get("use_moh", False)
+        self.moh_shared_heads = kwargs.get("moh_shared_heads", 4)
+        self.moh_routed_head = kwargs.get("moh_routed_head", 1)
+        self.moh_balance_loss_weight = kwargs.get("moh_balance_loss_weight", 0.01)
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -244,7 +249,22 @@ class MOEFeedForwardV2(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = Attention(config)
+        if config.use_moh:
+            from model.moh import MoHAttention
+            self.self_attn = MoHAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                shared_heads=config.moh_shared_heads,
+                routed_head=config.moh_routed_head,
+                balance_loss_weight=config.moh_balance_loss_weight,
+                dropout=config.dropout,
+                flash_attn=config.flash_attn,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+        else:
+            self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if not config.use_moe:
@@ -300,6 +320,10 @@ class MiniMindModel(nn.Module):
             presents.append(present)
         hidden_states = self.norm(hidden_states)
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, (MOEFeedForward, MOEFeedForwardV2))], hidden_states.new_zeros(1).squeeze())
+        # 如果使用 MoH，也收集 attention 的负载均衡损失
+        from model.moh import MoHAttention
+        moh_aux = sum([l.self_attn.aux_loss for l in self.layers if isinstance(l.self_attn, MoHAttention)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = aux_loss + moh_aux
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -324,7 +348,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
 
     def reset_moe_stats(self):
-        """重置所有 V2 MoE 层的专家利用率统计"""
+        """重置所有 V2 MoE 层 + MoH 层的利用率统计"""
         for layer in self.model.layers:
             if isinstance(layer.mlp, MOEFeedForwardV2):
                 layer.mlp.reset_moe_stats()
@@ -335,6 +359,24 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         for i, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, MOEFeedForwardV2):
                 s = layer.mlp.get_moe_stats()
+                if s is not None:
+                    stats[i] = s
+        return stats
+
+    def reset_moh_stats(self):
+        """重置所有 MoH 层的利用率统计"""
+        from model.moh import MoHAttention
+        for layer in self.model.layers:
+            if isinstance(layer.self_attn, MoHAttention):
+                layer.self_attn.reset_moh_stats()
+
+    def get_moh_stats(self):
+        """返回每层 MoH 专家利用率 {layer_id: tensor[num_experts]}"""
+        from model.moh import MoHAttention
+        stats = {}
+        for i, layer in enumerate(self.model.layers):
+            if isinstance(layer.self_attn, MoHAttention):
+                s = layer.self_attn.get_moh_stats()
                 if s is not None:
                     stats[i] = s
         return stats

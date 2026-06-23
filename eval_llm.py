@@ -20,6 +20,8 @@ def init_model(args):
             num_experts=args.num_experts,
             num_experts_per_tok=args.num_experts_per_tok,
             moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio,
+            use_moh=bool(args.use_moh),
+            moh_shared_heads=args.moh_shared_heads,
             inference_rope_scaling=args.inference_rope_scaling
         ))
         moe_suffix = '_moe' if args.use_moe else ''
@@ -54,6 +56,8 @@ def main():
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--show_moe_stats', default=0, type=int, choices=[0, 1], help="显示MoE V2各层专家利用率分布")
+    parser.add_argument('--use_moh', default=0, type=int, choices=[0, 1], help="是否使用MoH(Mixture-of-Heads)注意力")
+    parser.add_argument('--moh_shared_heads', default=4, type=int, help="MoH始终激活的Q头数")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     
@@ -124,6 +128,26 @@ def main():
                 print('━' * 55)
             else:
                 print('[MoE Stats] 无 MoE V2 层，跳过统计')
+
+            # MoH 统计
+            if args.use_moh:
+                moh_stats = model.get_moh_stats()
+                if moh_stats:
+                    print(f'\n[MoH Stats] 各层Q头专家平均利用率 (共 {gen_tokens} tokens)')
+                    num_experts = len(next(iter(moh_stats.values())))
+                    header = f'  Expert | ' + ' | '.join([f'L{lid:02d}  ' for lid in sorted(moh_stats.keys())]) + ' |  Avg  '
+                    print(header)
+                    print('-' * len(header))
+                    avg_util = torch.stack(list(moh_stats.values())).mean(dim=0)
+                    for ei in range(num_experts):
+                        row = f'  E{ei:02d}    | '
+                        for lid in sorted(moh_stats.keys()):
+                            row += f'{moh_stats[lid][ei].item()*100:4.1f}% | '
+                        row += f'{avg_util[ei].item()*100:4.1f}%'
+                        print(row)
+                    print('━' * 55)
+                else:
+                    print('[MoH Stats] 无 MoH 层，跳过统计')
 
 if __name__ == "__main__":
     main()
