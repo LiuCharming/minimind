@@ -55,7 +55,7 @@ class MoEConfig:
     # ── 维度 ──
     hidden_size: int = 512                # 隐藏层维度
     intermediate_size: int = 1024          # 每个专家的中间维度 (FFN inter_dim)
-    expert_intermediate_ratio: float = 1.0  # 专家 FFN 相对稠密 MLP 的比例 (1.0 = 全尺寸)
+    expert_intermediate_ratio: float = 0.5  # 专家 FFN 相对稠密 MLP 的比例 (1.0 = 全尺寸)
 
     # ── 专家 ──
     num_experts: int = 6                  # 专家总数
@@ -668,8 +668,9 @@ if __name__ == "__main__":
     config = MoEConfig(
         hidden_size=512,
         intermediate_size=1024,
-        num_experts=6,
-        top_k=1,
+        num_experts=16,
+        top_k=2,
+        expert_intermediate_ratio = 0.2,
     )
 
     print(f"\nConfig: hidden={config.hidden_size}, "
