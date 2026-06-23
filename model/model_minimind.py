@@ -212,15 +212,12 @@ class MOEFeedForwardV2(nn.Module):
         )
         self.moe_block = MoEBlock(moe_config)
         self.aux_loss = torch.zeros(1).squeeze()
-        self.gate_residual = None  # 跨层路由状态
 
     def forward(self, x):
-        # detach 上一轮的 gate_residual: 经过 backward 后计算图已释放, 必须切断梯度
-        gate_input = self.gate_residual.detach() if self.gate_residual is not None else None
-        out, gate, balance_loss, _ = self.moe_block(
-            x, gate_residual=gate_input, compute_loss=self.training
+        # gate_residual 跨层传播需要模型级改动(逐层传递gate), 这里作为drop-in替换不启用
+        out, _, balance_loss, _ = self.moe_block(
+            x, gate_residual=None, compute_loss=self.training
         )
-        self.gate_residual = gate.detach()  # 存 detached 版本供下轮使用
         self.aux_loss = balance_loss
         return out
 
