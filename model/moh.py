@@ -162,12 +162,12 @@ class MoHAttention(nn.Module):
         counts.index_add_(0, flat, ones)
         return counts / n_votes
 
-    # ── 推理优化路径 ────────────────────────────────────────────────────────
+    # ── 推理优化路径 (通用 top-k) ───────────────────────────────────────────
 
-    def _forward_inference_top1(
+    def _forward_inference(
         self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None
     ):
-        """推理路径: 只计算 shared heads + 1 selected expert, 节省计算"""
+        """推理路径: 只计算 shared heads + routed_head 个 selected expert heads, 节省 attention 计算量"""
         bsz, seq_len, _ = x.shape
         cos, sin = position_embeddings
 
@@ -176,19 +176,19 @@ class MoHAttention(nn.Module):
         xk = self.k_proj(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim)
         xv = self.v_proj(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
-        # 2. 路由: L2 norm → argmax
+        # 2. 路由: L2 norm → top-k
         q_view = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
-        expert_q = q_view[:, :, self.shared_heads:]
+        expert_q = q_view[:, :, self.shared_heads:]  # (B, T, num_experts, D)
         expert_norms = self._l2_norm(expert_q)
-        best_expert = torch.argmax(expert_norms, dim=-1)  # (B, T)
+        _, keep_indices = torch.topk(expert_norms, k=self.routed_head, dim=-1)  # (B, T, k)
 
-        # 3. 构造 Q: shared + 1 selected expert
+        # 3. 构造 Q: shared + k selected expert heads
         shared_q = q_view[:, :, :self.shared_heads]  # (B, T, S, D)
-        idx_exp = best_expert.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim)
-        selected_q = torch.gather(expert_q, 2, idx_exp).squeeze(2)  # (B, T, D)
-        q = torch.cat([shared_q, selected_q.unsqueeze(2)], dim=2)  # (B, T, S+1, D)
+        gather_idx = keep_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)  # (B, T, k, D)
+        selected_q = torch.gather(expert_q, dim=2, index=gather_idx)  # (B, T, k, D)
+        q = torch.cat([shared_q, selected_q], dim=2)  # (B, T, S+k, D)
 
-        actual_n_heads = self.shared_heads + 1
+        actual_n_heads = self.shared_heads + self.routed_head
 
         # 4. QK Norm + RoPE (保持 [B, T, H, D] 兼容 MiniMind convention)
         q_reshaped = q.reshape(bsz * seq_len * actual_n_heads, self.head_dim)
@@ -204,26 +204,22 @@ class MoHAttention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
-        # 6. GQA Expansion (适配 shared+1 heads)
+        # 6. GQA — 若 active heads 不能被 KV heads 整除，退回全量训练路径
         if actual_n_heads % self.n_kv_heads != 0:
-            # 退化为全量计算
-            q_orig = q.view(bsz, actual_n_heads, -1, self.head_dim)
-            # Pad to full n_heads
             return self._forward_training(x, position_embeddings, past_key_value, use_cache, attention_mask)
 
         n_kv_groups = actual_n_heads // self.n_kv_heads
-        kv_b = xk  # (B, T_kv, n_kv_heads, D)
 
         # Repeat KV
-        k_exp = kv_b[:, :, :, None, :].expand(bsz, -1, self.n_kv_heads, n_kv_groups, self.head_dim)
+        k_exp = xk[:, :, :, None, :].expand(bsz, -1, self.n_kv_heads, n_kv_groups, self.head_dim)
         k_exp = k_exp.reshape(bsz, -1, actual_n_heads, self.head_dim).transpose(1, 2)
         v_exp = xv[:, :, :, None, :].expand(bsz, -1, self.n_kv_heads, n_kv_groups, self.head_dim)
         v_exp = v_exp.reshape(bsz, -1, actual_n_heads, self.head_dim).transpose(1, 2)
 
-        # 7. Attention
+        # 7. Attention (reduced heads)
         is_causal = past_key_value is None
         if self.flash and seq_len > 1 and attention_mask is None:
-            output = F.scaled_dot_product_attention(
+            y = F.scaled_dot_product_attention(
                 q, k_exp, v_exp, dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal
             )
         else:
@@ -234,13 +230,35 @@ class MoHAttention(nn.Module):
                 ).triu(1)
             if attention_mask is not None:
                 scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(q)) @ v_exp
+            y = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(q)) @ v_exp
 
-        # 8. Output
-        output = output.transpose(1, 2).reshape(bsz, seq_len, actual_n_heads * self.head_dim)
-        output = self.resid_dropout(self.o_proj(output))
+        y = y.transpose(1, 2)  # (B, T, S+k, D)
 
-        return output, past_kv
+        # 8. Scatter 回全量 n_heads → o_proj 维度匹配
+        y_shared = y[:, :, :self.shared_heads, :]  # (B, T, S, D)
+        y_selected = y[:, :, self.shared_heads:, :]  # (B, T, k, D)
+
+        # 把 selected 的结果放回原始 expert 位置，其余填 0
+        y_expert_full = torch.zeros(
+            bsz, seq_len, self.num_experts, self.head_dim, device=y.device, dtype=y.dtype
+        )
+        scatter_idx = keep_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+        y_expert_full.scatter_(dim=2, index=scatter_idx, src=y_selected)
+        y = torch.cat([y_shared, y_expert_full], dim=2)  # (B, T, n_heads, D)
+
+        # 9. Output
+        y = y.reshape(bsz, seq_len, self.n_heads * self.head_dim)
+        y = self.resid_dropout(self.o_proj(y))
+
+        # 累积利用率统计
+        expert_util = self._expert_utilization(keep_indices, bsz, seq_len)
+        if self._expert_util_sum is None:
+            self._expert_util_sum = expert_util.clone()
+        else:
+            self._expert_util_sum += expert_util
+        self._expert_util_cnt += 1
+
+        return y, past_kv
 
     # ── 训练路径 ────────────────────────────────────────────────────────────
 
@@ -333,8 +351,8 @@ class MoHAttention(nn.Module):
     # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        if not self.training and self.routed_head == 1:
-            return self._forward_inference_top1(x, position_embeddings, past_key_value, use_cache, attention_mask)
+        if not self.training:
+            return self._forward_inference(x, position_embeddings, past_key_value, use_cache, attention_mask)
         return self._forward_training(x, position_embeddings, past_key_value, use_cache, attention_mask)
 
     # ── 统计方法 ────────────────────────────────────────────────────────────
