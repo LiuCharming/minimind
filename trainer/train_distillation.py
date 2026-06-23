@@ -170,6 +170,7 @@ if __name__ == "__main__":
     parser.add_argument('--teacher_moe_type', default='v1', type=str, choices=['v1', 'v2'], help="教师MoE类型")
     parser.add_argument('--num_experts', default=4, type=int, help="专家数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token激活的专家数")
+    parser.add_argument('--moe_expert_intermediate_ratio', default=0.5, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
     parser.add_argument('--from_student_weight', default='full_sft', type=str, help="学生模型基于哪个权重")
     parser.add_argument('--from_teacher_weight', default='full_sft', type=str, help="教师模型基于哪个权重")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -188,9 +189,11 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.student_use_moe),
-                                       moe_type=args.student_moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok)
+                                       moe_type=args.student_moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok,
+                                       moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio)
     lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.teacher_use_moe),
-                                       moe_type=args.teacher_moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok)
+                                       moe_type=args.teacher_moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok,
+                                       moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio)
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========

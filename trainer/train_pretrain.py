@@ -104,7 +104,7 @@ if __name__ == "__main__":
     parser.add_argument('--moe_type', default='v1', type=str, choices=['v1', 'v2'], help="MoE类型（v1=原始MOEFeedForward, v2=独立MoEBlock）")
     parser.add_argument('--num_experts', default=4, type=int, help="专家数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token激活的专家数")
-    parser.add_argument('--moe_expert_intermediate_ratio', default=1.0, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
+    parser.add_argument('--moe_expert_intermediate_ratio', default=0.5, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
