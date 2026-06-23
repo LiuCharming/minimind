@@ -312,9 +312,9 @@ def compute_attention_stats(model, tokenizer, device, seq_len=128):
         xk = attn.k_proj(normed_x).view(1, actual_len, attn.n_local_kv_heads if hasattr(attn, 'n_local_kv_heads') else attn.n_kv_heads, attn.head_dim)
         xv = attn.v_proj(normed_x).view(1, actual_len, attn.n_local_kv_heads if hasattr(attn, 'n_local_kv_heads') else attn.n_kv_heads, attn.head_dim)
 
-        # RoPE
-        cos = freqs_cos[:actual_len].unsqueeze(0).unsqueeze(0)
-        sin = freqs_sin[:actual_len].unsqueeze(0).unsqueeze(0)
+        # RoPE — cos/sin 传入 (T, D), apply_rotary_pos_emb 内部 unsqueeze
+        cos = freqs_cos[:actual_len]
+        sin = freqs_sin[:actual_len]
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         # QK^T
