@@ -221,20 +221,12 @@ class MOEFeedForwardV2(nn.Module):
             x, gate_residual=None, compute_loss=self.training
         )
         self.aux_loss = balance_loss
-        # 累积专家利用率 (训练/推理通用)
+        # 累积专家利用率 (训练/推理通用，供 get_moe_stats 查询)
         if self._expert_util_sum is None:
             self._expert_util_sum = expert_util.detach().clone()
         else:
             self._expert_util_sum += expert_util.detach()
         self._expert_util_cnt += 1
-        # debug: 每100次前向打印一次专家利用率
-        if self.training and not hasattr(self, '_debug_cnt'):
-            self._debug_cnt = 0
-        if self.training:
-            self._debug_cnt += 1
-            if self._debug_cnt % 100 == 1:
-                util_str = ' '.join([f'e{i}:{v:.3f}' for i, v in enumerate(expert_util)])
-                print(f'[MoE Debug] aux_loss={balance_loss.item():.6f} expert_util=[{util_str}]')
         return out
 
     def reset_moe_stats(self):
