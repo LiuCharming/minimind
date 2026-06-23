@@ -76,6 +76,10 @@ class MoEConfig:
     # ── 并行 ──
     ep_size: int = 1                      # Expert Parallelism 分片数 (1 = 不分片)
 
+    # ── 性能优化 ──
+    use_fused_expert: bool = True         # 使用融合 FFN (gate+up 合并, 2 matmul 代替 3)
+    use_fused_inference: bool = False     # 推理时批量化 FFN 专家 (大专家数场景加速明显, 默认关)
+
     # ── 其他 ──
     router_init_std: float = 0.01         # Router 权重初始化标准差
 
@@ -97,8 +101,13 @@ def build_swiglu_expert(hidden_size: int, intermediate_size: int) -> nn.Module:
     return _SwiGLUExpert(hidden_size, intermediate_size)
 
 
+def build_fused_swiglu_expert(hidden_size: int, intermediate_size: int) -> nn.Module:
+    """构建融合 SwiGLU FFN 专家 (gate+up 合并为单次 matmul)"""
+    return _FusedSwiGLUExpert(hidden_size, intermediate_size)
+
+
 class _SwiGLUExpert(nn.Module):
-    """标准 SwiGLU FeedForward (默认专家实现)"""
+    """标准 SwiGLU FeedForward (3 matmuls: gate / up / down)"""
 
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
@@ -110,6 +119,28 @@ class _SwiGLUExpert(nn.Module):
         gate = F.silu(self.gate_proj(x))
         up = self.up_proj(x)
         return self.down_proj(gate * up)
+
+
+class _FusedSwiGLUExpert(nn.Module):
+    """
+    融合 SwiGLU FeedForward (2 matmuls: gate_up / down).
+
+    优化: W_gate_up = [W_gate; W_up] ∈ R^{2I × H}
+    gate_up = x @ W_gate_up^T  → chunk(gate, up) → silu(gate) * up → down_proj
+
+    相比标准版: 3 matmul → 2 matmul, 约 -1/3 次 kernel launch,
+    且输入 x 只读取一次，内存带宽更友好。
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(hidden_size, intermediate_size * 2, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -423,13 +454,21 @@ class MOELayer(nn.Module):
     """
 
     def __init__(self, config: MoEConfig,
-                 expert_factory: Callable[[int, int], nn.Module] = build_swiglu_expert):
+                 expert_factory: Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.config = config
         self.num_local_experts = config.num_experts // config.ep_size
 
+        if expert_factory is None:
+            expert_factory = build_fused_swiglu_expert if config.use_fused_expert else build_swiglu_expert
+        self.expert_factory = expert_factory
+
         self.gate = Router(config)
         self.experts = Experts(config, expert_factory)
+
+        # 缓存 FFN 专家数量 (用于批量化)
+        C = config.num_constant_experts
+        self.num_ffn_experts = config.num_experts - 2 - C
 
     def forward(self, *input: torch.Tensor,
                 gate_residual: Optional[torch.Tensor] = None,
@@ -467,8 +506,19 @@ class MOELayer(nn.Module):
 
         # 训练 / 推理分支
         if not self.training and not compute_loss:
-            output = self._moe_infer(reshaped_input, sorted_token_indices,
-                                     expert_counts, sorted_gate_weights)
+            # 自适应: 当 FFN 专家平均 token 数足够时用融合路径, 否则 loop 路径
+            if self.config.use_fused_inference and self.num_ffn_experts > 0:
+                ffn_total = expert_counts[:self.num_ffn_experts].sum().item()
+                # heuristic: 每个 FFN 专家平均 ≥ 8 token 时才值得批量化
+                if ffn_total >= self.num_ffn_experts * 8:
+                    output = self._moe_infer_fused(reshaped_input, sorted_token_indices,
+                                                    expert_counts, sorted_gate_weights)
+                else:
+                    output = self._moe_infer(reshaped_input, sorted_token_indices,
+                                             expert_counts, sorted_gate_weights)
+            else:
+                output = self._moe_infer(reshaped_input, sorted_token_indices,
+                                         expert_counts, sorted_gate_weights)
         else:
             output = self._moe_train(reshaped_input, sorted_token_indices,
                                      expert_counts, sorted_gate_weights)
@@ -571,6 +621,130 @@ class MOELayer(nn.Module):
         output.index_add_(dim=0, index=sorted_token_indices, source=sorted_outputs)
         return output
 
+    # ── 融合推理路径 (批量化 FFN 专家, 消除 for 循环) ──────────────────────
+
+    @torch.no_grad()
+    def _moe_infer_fused(self, reshaped_input: torch.Tensor,
+                         sorted_token_indices: torch.Tensor,
+                         expert_counts: torch.Tensor,
+                         sorted_gate_weights: torch.Tensor) -> torch.Tensor:
+        """
+        融合推理: 将所有 FFN 专家的 weight 堆叠 → 2 次 batched bmm 代替 N×3 次 matmul。
+
+        步骤:
+          1. 分离 FFN 专家 vs 特殊专家 (Constant/Copy/Zero)
+          2. FFN 专家:  pad token batch → stack weights → batched bmm × 2
+          3. 特殊专家:  逐个处理 (轻量, 无 matmul)
+          4. 合并输出 → index_add_ 路由回去
+        """
+        num_tokens, hidden_dim = reshaped_input.shape
+        device = reshaped_input.device
+        dtype = reshaped_input.dtype
+
+        if sorted_token_indices.numel() == 0:
+            return torch.zeros_like(reshaped_input)
+
+        sorted_token_indices = sorted_token_indices.to(device=device, dtype=torch.long).contiguous()
+        sorted_token_indices = sorted_token_indices.clamp(0, num_tokens - 1)
+        sorted_gate_weights = sorted_gate_weights.to(device=device, dtype=dtype).contiguous()
+        sorted_tokens = reshaped_input.index_select(0, sorted_token_indices)
+
+        num_ffn = self.num_ffn_experts
+        num_special = self.num_local_experts - num_ffn
+
+        # ── 1. 分离 FFN / 特殊专家 ──
+        ffn_info = []       # (expert_id, start, end, n_tok)
+        special_info = []   # (expert_id, start, end, n_tok)
+        start_idx = 0
+        for expert_id in range(self.num_local_experts):
+            n_tok = int(expert_counts[expert_id].item())
+            if n_tok == 0:
+                continue
+            end_idx = start_idx + n_tok
+            if expert_id < num_ffn:
+                ffn_info.append((expert_id, start_idx, end_idx, n_tok))
+            else:
+                special_info.append((expert_id, start_idx, end_idx, n_tok))
+            start_idx = end_idx
+
+        # output 累积器
+        all_sorted_indices = []
+        all_sorted_outputs = []
+
+        # ── 2. FFN 专家 → batched bmm ──
+        if ffn_info:
+            ffn_expert_indices = [info[0] for info in ffn_info]
+            max_n = max(info[3] for info in ffn_info)
+
+            # 收集 padded token batches
+            padded_batches = []
+            padded_gates = []
+            for _, s, e, n_tok in ffn_info:
+                pad = max_n - n_tok
+                tokens = sorted_tokens[s:e]
+                gates = sorted_gate_weights[s:e]
+                if pad > 0:
+                    tokens = F.pad(tokens, (0, 0, 0, pad))
+                    gates = F.pad(gates, (0, pad))
+                padded_batches.append(tokens)
+                padded_gates.append(gates)
+
+            tokens_stacked = torch.stack(padded_batches, dim=0)  # (num_ffn, max_n, H)
+            gates_stacked = torch.stack(padded_gates, dim=0)     # (num_ffn, max_n)
+
+            # 堆叠 FFN 权重
+            gate_up_weights = torch.stack([
+                self.experts.experts[eid].gate_up_proj.weight
+                for eid in ffn_expert_indices
+            ], dim=0)  # (num_ffn, 2*I, H)
+            down_weights = torch.stack([
+                self.experts.experts[eid].down_proj.weight
+                for eid in ffn_expert_indices
+            ], dim=0)  # (num_ffn, H, I)
+
+            inter_dim = gate_up_weights.shape[1] // 2
+
+            # Batched matmul 1: gate_up (num_ffn, max_n, H) @ (num_ffn, H, 2*I)
+            gate_up = torch.bmm(
+                tokens_stacked, gate_up_weights.transpose(1, 2)
+            )  # (num_ffn, max_n, 2*I)
+            gate, up = gate_up.chunk(2, dim=-1)  # both (num_ffn, max_n, I)
+
+            # SwiGLU
+            hidden = F.silu(gate) * up  # (num_ffn, max_n, I)
+
+            # Batched matmul 2: down (num_ffn, max_n, I) @ (num_ffn, I, H)
+            outputs_stacked = torch.bmm(
+                hidden, down_weights.transpose(1, 2)
+            )  # (num_ffn, max_n, H)
+
+            # 乘 gate + 去除 padding
+            outputs_stacked = outputs_stacked * gates_stacked.unsqueeze(-1)
+            for bi, (_, s, e, n_tok) in enumerate(ffn_info):
+                out_slice = outputs_stacked[bi, :n_tok]  # (n_tok, H)
+                all_sorted_outputs.append(out_slice)
+                all_sorted_indices.append(sorted_token_indices[s:e])
+
+        # ── 3. 特殊专家 → 逐个处理 (无 matmul, 开销可忽略) ──
+        for expert_id, s, e, n_tok in special_info:
+            expert_tokens = sorted_tokens[s:e]
+            expert_output = self.experts.experts[expert_id](expert_tokens)
+            expert_gates = sorted_gate_weights[s:e]
+            if expert_output.dtype != dtype:
+                expert_output = expert_output.to(dtype)
+            all_sorted_outputs.append(expert_output * expert_gates.unsqueeze(-1))
+            all_sorted_indices.append(sorted_token_indices[s:e])
+
+        # ── 4. 合并 → scatter ──
+        if not all_sorted_outputs:
+            return torch.zeros_like(reshaped_input)
+
+        merged_indices = torch.cat(all_sorted_indices, dim=0)
+        merged_outputs = torch.cat(all_sorted_outputs, dim=0)
+        output = torch.zeros(num_tokens, hidden_dim, device=device, dtype=dtype)
+        output.index_add_(dim=0, index=merged_indices, source=merged_outputs)
+        return output
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 顶层封装
@@ -589,7 +763,7 @@ class MoEBlock(nn.Module):
     """
 
     def __init__(self, config: MoEConfig,
-                 expert_factory: Callable[[int, int], nn.Module] = build_swiglu_expert):
+                 expert_factory: Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.moe = MOELayer(config, expert_factory)
 
@@ -623,11 +797,12 @@ class MoEBlockWithDense(nn.Module):
     """
 
     def __init__(self, config: MoEConfig,
-                 expert_factory: Callable[[int, int], nn.Module] = build_swiglu_expert):
+                 expert_factory: Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.config = config
         self.norm = nn.RMSNorm(config.hidden_size)
-        self.dense_mlp = _SwiGLUExpert(config.hidden_size, config.intermediate_size)
+        factory = expert_factory or (build_fused_swiglu_expert if config.use_fused_expert else build_swiglu_expert)
+        self.dense_mlp = factory(config.hidden_size, config.intermediate_size)
         self.moe = MOELayer(config, expert_factory)
 
     def forward(self, x: torch.Tensor,

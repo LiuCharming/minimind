@@ -49,6 +49,8 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_use_2layer_gate = kwargs.get("moe_use_2layer_gate", False)
         self.moe_balance_loss_weight = kwargs.get("moe_balance_loss_weight", 0.01)
         self.moe_expert_intermediate_ratio = kwargs.get("moe_expert_intermediate_ratio", 1.0)
+        self.moe_use_fused_expert = kwargs.get("moe_use_fused_expert", True)
+        self.moe_use_fused_inference = kwargs.get("moe_use_fused_inference", False)
         # MoH config
         self.use_moh = kwargs.get("use_moh", False)
         self.moh_shared_heads = kwargs.get("moh_shared_heads", 4)
@@ -214,6 +216,8 @@ class MOEFeedForwardV2(nn.Module):
             balance_loss_weight=config.moe_balance_loss_weight,
             use_normalized_loss=True,
             ep_size=1,
+            use_fused_expert=config.moe_use_fused_expert,
+            use_fused_inference=config.moe_use_fused_inference,
         )
         self.moe_block = MoEBlock(moe_config)
         self.aux_loss = torch.zeros(1).squeeze()
