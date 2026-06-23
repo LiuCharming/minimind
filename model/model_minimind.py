@@ -48,7 +48,7 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_use_mixtral_gating = kwargs.get("moe_use_mixtral_gating", True)
         self.moe_use_2layer_gate = kwargs.get("moe_use_2layer_gate", False)
         self.moe_balance_loss_weight = kwargs.get("moe_balance_loss_weight", 0.01)
-        self.moe_expert_intermediate_ratio = kwargs.get("moe_expert_intermediate_ratio", 0.5)
+        self.moe_expert_intermediate_ratio = kwargs.get("moe_expert_intermediate_ratio", 1.0)
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model

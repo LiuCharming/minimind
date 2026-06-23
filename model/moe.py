@@ -55,7 +55,7 @@ class MoEConfig:
     # ── 维度 ──
     hidden_size: int = 512                # 隐藏层维度
     intermediate_size: int = 1024          # 每个专家的中间维度 (FFN inter_dim)
-    expert_intermediate_ratio: float = 0.5  # 专家 FFN 相对稠密 MLP 的比例 (0.5 = 减半)
+    expert_intermediate_ratio: float = 1.0  # 专家 FFN 相对稠密 MLP 的比例 (1.0 = 全尺寸)
 
     # ── 专家 ──
     num_experts: int = 6                  # 专家总数
