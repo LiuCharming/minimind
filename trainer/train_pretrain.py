@@ -24,6 +24,7 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
+    last_max_grad = 0
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
@@ -41,6 +42,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            # 记录最大梯度 (clip 前)
+            last_max_grad = max(p.grad.abs().max().item() for p in model.parameters() if p.grad is not None)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
@@ -55,8 +58,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, max_grad: {last_max_grad:.2f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "max_grad": last_max_grad, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
