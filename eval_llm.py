@@ -19,6 +19,7 @@ def init_model(args):
             moe_type=args.moe_type,
             num_experts=args.num_experts,
             num_experts_per_tok=args.num_experts_per_tok,
+            moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio,
             inference_rope_scaling=args.inference_rope_scaling
         ))
         moe_suffix = '_moe' if args.use_moe else ''
@@ -44,6 +45,7 @@ def main():
     parser.add_argument('--moe_type', default='v1', type=str, choices=['v1', 'v2'], help="MoE类型（v1=原始, v2=独立MoEBlock）")
     parser.add_argument('--num_experts', default=4, type=int, help="专家数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token激活的专家数")
+    parser.add_argument('--moe_expert_intermediate_ratio', default=0.5, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
     parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
