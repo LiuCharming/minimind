@@ -38,11 +38,17 @@ class MiniMindConfig(PretrainedConfig):
             "type": "yarn"
         } if self.inference_rope_scaling else None
         ### MoE specific configs (ignored if use_moe = False)
+        self.moe_type = kwargs.get("moe_type", "v1")  # "v1"=原始MOEFeedForward, "v2"=独立MoEBlock(多种专家类型)
         self.num_experts = kwargs.get("num_experts", 4)
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        # v2 MoE specific
+        self.moe_use_mixtral_gating = kwargs.get("moe_use_mixtral_gating", True)
+        self.moe_use_2layer_gate = kwargs.get("moe_use_2layer_gate", False)
+        self.moe_balance_loss_weight = kwargs.get("moe_balance_loss_weight", 1.0)
+        self.moe_expert_intermediate_ratio = kwargs.get("moe_expert_intermediate_ratio", 0.5)
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -175,13 +181,62 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
 
+class MOEFeedForwardV2(nn.Module):
+    """
+    MoE V2 wrapper — 对接独立的 model.moe 模块, 接口与 MOEFeedForward 完全一致。
+
+    相比 V1 (MOEFeedForward):
+      - 4 种专家类型 (FFN / Constant / Copy / Zero)
+      - CV² 负载均衡损失
+      - Mixtral 风格 gating / 双层 gate 可选
+      - 训练 / 推理路径分离
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        from model.moe import MoEConfig, MoEBlock
+
+        moe_config = MoEConfig(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            expert_intermediate_ratio=config.moe_expert_intermediate_ratio,
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            use_mixtral_gating=config.moe_use_mixtral_gating,
+            use_2layer_gate=config.moe_use_2layer_gate,
+            use_logits_norm=True,
+            gate_norm_std=1.0,
+            balance_loss_weight=config.moe_balance_loss_weight,
+            use_normalized_loss=True,
+            ep_size=1,
+        )
+        self.moe_block = MoEBlock(moe_config)
+        self.aux_loss = torch.zeros(1).squeeze()
+        self.gate_residual = None  # 跨层路由状态
+
+    def forward(self, x):
+        # detach 上一轮的 gate_residual: 经过 backward 后计算图已释放, 必须切断梯度
+        gate_input = self.gate_residual.detach() if self.gate_residual is not None else None
+        out, gate, balance_loss, _ = self.moe_block(
+            x, gate_residual=gate_input, compute_loss=self.training
+        )
+        self.gate_residual = gate.detach()  # 存 detached 版本供下轮使用
+        self.aux_loss = balance_loss
+        return out
+
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        if not config.use_moe:
+            self.mlp = FeedForward(config)
+        elif config.moe_type == "v2":
+            self.mlp = MOEFeedForwardV2(config)
+        else:
+            self.mlp = MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -228,7 +283,7 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, (MOEFeedForward, MOEFeedForwardV2))], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):

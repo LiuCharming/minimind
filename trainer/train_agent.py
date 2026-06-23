@@ -388,6 +388,9 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=768, type=int, help="模型隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="模型层数")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE")
+    parser.add_argument('--moe_type', default='v1', type=str, choices=['v1', 'v2'], help="MoE类型（v1=原始MOEFeedForward, v2=独立MoEBlock）")
+    parser.add_argument('--num_experts', default=4, type=int, help="专家数量")
+    parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token激活的专家数")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="最大序列长度")
     parser.add_argument("--max_gen_len", type=int, default=768, help="单次最大生成长度")
     parser.add_argument("--max_total_len", type=int, default=2500, help="训练侧最终总长度上界")
@@ -418,7 +421,8 @@ if __name__ == "__main__":
 
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
+                               max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe),
+                               moe_type=args.moe_type, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
     device_type = "cuda" if "cuda" in args.device else "cpu"

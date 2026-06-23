@@ -3,6 +3,16 @@
 """
 import os
 import sys
+
+# 项目根目录 (trainer_utils.py 在 trainer/ 下, 上级就是项目根)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_path(path: str) -> str:
+    """将以 ../ 开头的相对路径解析为项目根目录下的绝对路径"""
+    if path.startswith('../'):
+        return os.path.normpath(os.path.join(_PROJECT_ROOT, path[3:]))
+    return path
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
@@ -61,6 +71,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    save_dir = _resolve_path(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -117,12 +128,12 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(_resolve_path(tokenizer_path))
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        weight_path = f'{_resolve_path(save_dir)}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 
