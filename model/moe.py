@@ -142,6 +142,31 @@ class _FusedSwiGLUExpert(nn.Module):
         gate, up = gate_up.chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """兼容旧格式 checkpoint: 自动将 gate_proj + up_proj 合并为 gate_up_proj"""
+        gate_key = prefix + 'gate_proj.weight'
+        up_key = prefix + 'up_proj.weight'
+        fused_key = prefix + 'gate_up_proj.weight'
+        # PyTorch 传入的 state_dict 可能已 strip prefix (prefix='', key='gate_proj.weight')
+        # 也可能保留 prefix (prefix='experts.0.', key='experts.0.gate_proj.weight')
+        # 两种都检查
+        gate_key_short = 'gate_proj.weight'
+        up_key_short = 'up_proj.weight'
+        fused_key_short = 'gate_up_proj.weight'
+
+        if fused_key not in state_dict and fused_key_short not in state_dict:
+            if gate_key in state_dict and up_key in state_dict:
+                gate_w = state_dict.pop(gate_key)
+                up_w = state_dict.pop(up_key)
+                state_dict[fused_key] = torch.cat([gate_w, up_w], dim=0)
+            elif gate_key_short in state_dict and up_key_short in state_dict:
+                gate_w = state_dict.pop(gate_key_short)
+                up_w = state_dict.pop(up_key_short)
+                state_dict[fused_key_short] = torch.cat([gate_w, up_w], dim=0)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                       missing_keys, unexpected_keys, error_msgs)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 特殊专家类型
