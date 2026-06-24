@@ -351,8 +351,16 @@ class MoHAttention(nn.Module):
     # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        if not self.training:
-            return self._forward_inference(x, position_embeddings, past_key_value, use_cache, attention_mask)
+        # NOTE: 始终使用 training 路径。
+        # _forward_inference 存在两个根本性 bug:
+        #   1. GQA KV 映射错位 — 推理路径减少 Q 头后 GQA factor 改变,
+        #      导致 Q head → KV head 对应关系与训练不一致
+        #      (e.g. expert head 6 训练时→KV[2], 推理时→KV[3])
+        #   2. Softmax 分布差异 — 推理在 8 头上做 softmax, 训练在 12 头
+        # 要正确实现推理优化需要:
+        #   - KV 始终用 full n_heads GQA 展开
+        #   - prefill 阶段用全量 attention (无法优化)
+        #   - generation 阶段 (T_q=1) 从 full K/V cache 中 gather 正确 head
         return self._forward_training(x, position_embeddings, past_key_value, use_cache, attention_mask)
 
     # ── 统计方法 ────────────────────────────────────────────────────────────
