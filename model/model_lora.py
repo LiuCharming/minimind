@@ -30,6 +30,42 @@ def _is_router_gate(module_path: str) -> bool:
     return bool(re.search(r'\.gate\.wg$', module_path))
 
 
+def _get_expert_parent(model: nn.Module, module_path: str):
+    """根据路径获取 Linear 所属的 expert 模块 (experts.experts.N 中的容器)"""
+    import re
+    match = re.search(r'\.(experts\.experts\.(\d+))', module_path)
+    if not match:
+        return None
+    idx = int(match.group(2))
+    prefix_parts = module_path[:match.start()].split('.')
+    obj = model
+    for p in prefix_parts:
+        if p.isdigit():
+            obj = obj[int(p)]
+        else:
+            obj = getattr(obj, p)
+    # obj 现在是 MOELayer, obj.experts 是 Experts 容器,
+    # obj.experts.experts 是 nn.ModuleList
+    return obj.experts.experts[idx]
+
+
+def _is_special_expert(model: nn.Module, module_path: str) -> bool:
+    """
+    检查该 Linear 是否属于特殊 expert (Constant/Copy/Zero) 内部。
+    这些专家不应该加 LoRA — 只有 FFN 专家 (_SwiGLUExpert / _FusedSwiGLUExpert) 可以。
+    """
+    from model.moe import ConstantExpert, CopyExpert, ZeroExpert
+    expert = _get_expert_parent(model, module_path)
+    return isinstance(expert, (ConstantExpert, CopyExpert, ZeroExpert))
+
+
+def _is_ffn_expert(model: nn.Module, module_path: str) -> bool:
+    """检查该 Linear 是否属于 FFN 专家 (_SwiGLUExpert / _FusedSwiGLUExpert)"""
+    from model.moe import _SwiGLUExpert, _FusedSwiGLUExpert
+    expert = _get_expert_parent(model, module_path)
+    return isinstance(expert, (_SwiGLUExpert, _FusedSwiGLUExpert))
+
+
 def apply_lora(model, rank=16, target_modules=None):
     """
     对模型应用 LoRA 低秩适配器。
@@ -47,16 +83,17 @@ def apply_lora(model, rank=16, target_modules=None):
         target_modules = ['attention']
 
     mode = target_modules[0] if isinstance(target_modules, list) and len(target_modules) == 1 else None
-    skip_routed = False
-    include_router = False
+    is_moe_mode = (mode == 'moe')
+    is_all_mode = (mode == 'all')
 
     if mode == 'attention':
         target_names = {'q_proj', 'o_proj'}
-    elif mode == 'moe':
-        target_names = {'q_proj', 'o_proj', 'wg'}
-        skip_routed = True       # 跳过 routed expert 的 wg
-        include_router = True    # 但保留 router gate.wg
-    elif mode == 'all':
+    elif is_moe_mode:
+        # MoE 策略: attention + router gate.wg + FFN expert 层
+        target_names = {'q_proj', 'o_proj',          # attention
+                        'gate_up_proj', 'gate_proj', 'up_proj', 'down_proj',  # FFN experts
+                        'wg'}                         # router gate.wg + FFN gate
+    elif is_all_mode:
         target_names = {'__all__'}
     else:
         target_names = set(target_modules)
@@ -71,22 +108,25 @@ def apply_lora(model, rank=16, target_modules=None):
         if '__all__' not in target_names and module_basename not in target_names:
             continue
 
-        # MoE 路由适配: gate.wg (768→4, 非方阵) 纳入; routed expert wg 跳过
-        is_router_wg = include_router and _is_router_gate(name)
-        is_routed = skip_routed and _is_routed_expert(name)
-
-        if is_routed:
+        # ── MoE 相关过滤 ──
+        # 特殊 expert (Constant/Copy/Zero) → 跳过
+        if is_moe_mode and _is_special_expert(model, name):
             continue
 
-        # 非路由模块要求方阵; 路由 gate.wg 允许非方阵
+        # Router gate.wg: 允许非方阵 (768→n_experts)
+        is_router_wg = is_moe_mode and _is_router_gate(name)
+        # FFN expert 层 (gate_up_proj 等): 允许非方阵
+        is_ffn_layer = is_moe_mode and _is_ffn_expert(model, name)
+
+        # 方阵检查
         is_square = module.in_features == module.out_features
-        if not is_square and not is_router_wg:
+        if not is_square and not (is_router_wg or is_ffn_layer):
             continue
 
-        # 路由器 gate.wg 的 rank 裁剪到 min(rank, out_features)
-        router_rank = min(rank, module.out_features) if is_router_wg else rank
+        # 路由器的 rank 裁剪到 min(rank, out_features)
+        cur_rank = min(rank, module.out_features) if is_router_wg else rank
 
-        lora = LoRA(module.in_features, module.out_features, rank=router_rank).to(model.device)
+        lora = LoRA(module.in_features, module.out_features, rank=cur_rank).to(model.device)
         setattr(module, "lora", lora)
         original_forward = module.forward
 
