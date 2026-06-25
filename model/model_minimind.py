@@ -4,6 +4,17 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
+# ══════════════════════════════════════════════════════════════
+#  可选: flash_attention_triton (适用于 2080 Ti 等 Turing 显卡)
+#  如果未安装, 自动回退到 PyTorch 原生的 scaled_dot_product_attention
+# ══════════════════════════════════════════════════════════════
+_FLASH_TRITON_AVAILABLE = False
+try:
+    from flash_attention_triton import flash_attention_v2
+    _FLASH_TRITON_AVAILABLE = True
+except ImportError:
+    pass
+
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Config
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -120,6 +131,8 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        # 2080 Ti / Turing 显卡专用: 使用 Triton 实现的 FlashAttentionV2 (比 PyTorch SDPA 更快)
+        self.use_triton_flash = _FLASH_TRITON_AVAILABLE and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         bsz, seq_len, _ = x.shape
@@ -135,13 +148,42 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+
+        # ─────────────── 选择 Attention 后端 ───────────────
+        # 1) Triton FlashAttentionV2: 2080 Ti 等 Turing 卡的最优选择
+        #    注意: flash_attention_v2 始终使用 causal mask, 且不支持 dropout
+        #    因此仅在 prefill (无 KV cache) 且无自定义 mask 时使用
+        _triton_ok = (
+            self.use_triton_flash
+            and past_key_value is None                    # prefill 阶段 (因果 mask 正确)
+            and (attention_mask is None or torch.all(attention_mask == 1))
+            and (not self.training or self.dropout == 0)  # Triton 内核不支持 dropout
+        )
+        # 2) PyTorch 原生 SDPA (也是 FlashAttention, 但走 cuDNN)
+        _sdpa_ok = (
+            not _triton_ok
+            and self.flash
+            and (seq_len > 1)
+            and (not self.is_causal or past_key_value is None)
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        )
+
+        if _triton_ok:
+            output = flash_attention_v2(
+                xq, xk, xv,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                deterministic=True
+            )
+        elif _sdpa_ok:
+            output = F.scaled_dot_product_attention(xq, xk, xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv

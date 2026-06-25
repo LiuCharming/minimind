@@ -70,6 +70,30 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def get_supported_dtype(requested_dtype="bfloat16", device_type="cuda"):
+    """
+    检测当前GPU是否支持所请求的混合精度类型。
+    - bfloat16 需要 Ampere (SM 8.0+) 或更新架构 (如 3090, A100, 4090 等)
+    - Turing (SM 7.5, 如 2080 Ti) 仅支持 float16
+    在不支持的GPU上自动回退并给出提示。
+    """
+    if device_type != "cuda" or not torch.cuda.is_available():
+        Logger("⚠️ 未检测到 CUDA 设备，使用 float32")
+        return torch.float32
+    if requested_dtype == "bfloat16":
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            Logger(f"⚠️ 当前 GPU (SM {major}.x, 如 2080 Ti) 不支持 bfloat16，自动回退到 float16")
+            Logger(f"   (训练时可添加 --dtype float16 消除此提示)")
+            return torch.float16
+        Logger(f"✓ GPU (SM {major}.x) 支持 bfloat16")
+        return torch.bfloat16
+    if requested_dtype == "float16":
+        return torch.float16
+    return torch.float32
+
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     save_dir = _resolve_path(save_dir)
     os.makedirs(save_dir, exist_ok=True)
@@ -133,7 +157,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{_resolve_path(save_dir)}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        weight_path = f'{_resolve_path(save_dir)}//{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 
