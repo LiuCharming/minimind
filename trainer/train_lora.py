@@ -102,6 +102,7 @@ if __name__ == "__main__":
     parser.add_argument('--moh_shared_heads', default=6, type=int, help="MoH始终激活的Q头数")
     parser.add_argument('--moh_routed_head', default=2, type=int, help="MoH每个token激活的专家Q头数(top-k)")
     parser.add_argument('--num_attention_heads', default=8, type=int, help="Q头总数（需为KV头数的整数倍）")
+    parser.add_argument('--lora_target', default='attention', type=str, choices=['attention', 'all'], help="LoRA 适配目标: attention=仅q_proj+o_proj, all=所有方阵Linear(含MoE FFN)")
     parser.add_argument("--data_path", type=str, default="../dataset/lora_medical.jsonl", help="LoRA训练数据路径")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练，默认full_sft")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -140,7 +141,7 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    apply_lora(model)
+    apply_lora(model, target_modules=[args.lora_target])
     
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())

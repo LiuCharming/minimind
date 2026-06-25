@@ -18,18 +18,41 @@ class LoRA(nn.Module):
         return self.B(self.A(x))
 
 
-def apply_lora(model, rank=16):
+def apply_lora(model, rank=16, target_modules=None):
+    """
+    对模型应用 LoRA 低秩适配器。
+
+    Args:
+        model: MiniMindForCausalLM 模型
+        rank: LoRA 秩 (默认 16)
+        target_modules: 要适配的模块名列表 (默认: ['q_proj', 'o_proj'])
+                       设为 None 或 ['all'] 则适配所有 in==out 的 Linear 层
+                       设为 ['attention'] 则只适配 self_attn 下的 q_proj + o_proj
+    """
+    if target_modules is None:
+        target_modules = ['attention']
+    if 'attention' in target_modules:
+        target_modules = [m for m in target_modules if m != 'attention'] + ['q_proj', 'o_proj']
+
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and module.in_features == module.out_features:
-            lora = LoRA(module.in_features, module.out_features, rank=rank).to(model.device)
-            setattr(module, "lora", lora)
-            original_forward = module.forward
+        if not isinstance(module, nn.Linear):
+            continue
+        if module.in_features != module.out_features:
+            continue
 
-            # 显式绑定
-            def forward_with_lora(x, layer1=original_forward, layer2=lora):
-                return layer1(x) + layer2(x)
+        # 过滤目标模块
+        module_basename = name.split('.')[-1]  # 取最后一层名称 (q_proj, o_proj, gate_up_proj 等)
+        if 'all' not in target_modules and module_basename not in target_modules:
+            continue
 
-            module.forward = forward_with_lora
+        lora = LoRA(module.in_features, module.out_features, rank=rank).to(model.device)
+        setattr(module, "lora", lora)
+        original_forward = module.forward
+
+        def forward_with_lora(x, layer1=original_forward, layer2=lora):
+            return layer1(x) + layer2(x)
+
+        module.forward = forward_with_lora
 
 
 def load_lora(model, path):
