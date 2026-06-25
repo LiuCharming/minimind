@@ -102,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument('--moh_shared_heads', default=6, type=int, help="MoH始终激活的Q头数")
     parser.add_argument('--moh_routed_head', default=2, type=int, help="MoH每个token激活的专家Q头数(top-k)")
     parser.add_argument('--num_attention_heads', default=8, type=int, help="Q头总数（需为KV头数的整数倍）")
-    parser.add_argument('--lora_target', default='attention', type=str, choices=['attention', 'all'], help="LoRA 适配目标: attention=仅q_proj+o_proj, all=所有方阵Linear(含MoE FFN)")
+    parser.add_argument('--lora_target', default='attention', type=str, choices=['attention', 'moe', 'all'], help="LoRA 适配策略: attention=仅q_proj+o_proj, moe=attention+shared_expert+router, all=所有方阵Linear")
     parser.add_argument("--data_path", type=str, default="../dataset/lora_medical.jsonl", help="LoRA训练数据路径")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练，默认full_sft")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")

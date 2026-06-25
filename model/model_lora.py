@@ -18,6 +18,18 @@ class LoRA(nn.Module):
         return self.B(self.A(x))
 
 
+def _is_routed_expert(module_path: str) -> bool:
+    """判断是否属于 routed expert (experts.experts.N.xxx)"""
+    import re
+    return bool(re.search(r'\.experts\.experts\.\d+', module_path))
+
+
+def _is_router_gate(module_path: str) -> bool:
+    """判断是否是 MoE 路由器的 gate.wg (Linear(768, n_experts))"""
+    import re
+    return bool(re.search(r'\.gate\.wg$', module_path))
+
+
 def apply_lora(model, rank=16, target_modules=None):
     """
     对模型应用 LoRA 低秩适配器。
@@ -25,27 +37,56 @@ def apply_lora(model, rank=16, target_modules=None):
     Args:
         model: MiniMindForCausalLM 模型
         rank: LoRA 秩 (默认 16)
-        target_modules: 要适配的模块名列表 (默认: ['q_proj', 'o_proj'])
-                       设为 None 或 ['all'] 则适配所有 in==out 的 Linear 层
-                       设为 ['attention'] 则只适配 self_attn 下的 q_proj + o_proj
+        target_modules: 适配策略 (默认: ['attention'])
+            ['attention']    — 仅 self_attn 的 q_proj + o_proj
+            ['moe']          — attention + router gate (适配路由决策)
+            ['all']          — 所有 in==out 的 Linear (含 routed experts)
+            ['q_proj', ...]  — 自定义目标模块名列表
     """
     if target_modules is None:
         target_modules = ['attention']
-    if 'attention' in target_modules:
-        target_modules = [m for m in target_modules if m != 'attention'] + ['q_proj', 'o_proj']
+
+    mode = target_modules[0] if isinstance(target_modules, list) and len(target_modules) == 1 else None
+    skip_routed = False
+    include_router = False
+
+    if mode == 'attention':
+        target_names = {'q_proj', 'o_proj'}
+    elif mode == 'moe':
+        target_names = {'q_proj', 'o_proj', 'wg'}
+        skip_routed = True       # 跳过 routed expert 的 wg
+        include_router = True    # 但保留 router gate.wg
+    elif mode == 'all':
+        target_names = {'__all__'}
+    else:
+        target_names = set(target_modules)
 
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
-        if module.in_features != module.out_features:
+
+        module_basename = name.split('.')[-1]
+
+        # 按名称过滤
+        if '__all__' not in target_names and module_basename not in target_names:
             continue
 
-        # 过滤目标模块
-        module_basename = name.split('.')[-1]  # 取最后一层名称 (q_proj, o_proj, gate_up_proj 等)
-        if 'all' not in target_modules and module_basename not in target_modules:
+        # MoE 路由适配: gate.wg (768→4, 非方阵) 纳入; routed expert wg 跳过
+        is_router_wg = include_router and _is_router_gate(name)
+        is_routed = skip_routed and _is_routed_expert(name)
+
+        if is_routed:
             continue
 
-        lora = LoRA(module.in_features, module.out_features, rank=rank).to(model.device)
+        # 非路由模块要求方阵; 路由 gate.wg 允许非方阵
+        is_square = module.in_features == module.out_features
+        if not is_square and not is_router_wg:
+            continue
+
+        # 路由器 gate.wg 的 rank 裁剪到 min(rank, out_features)
+        router_rank = min(rank, module.out_features) if is_router_wg else rank
+
+        lora = LoRA(module.in_features, module.out_features, rank=router_rank).to(model.device)
         setattr(module, "lora", lora)
         original_forward = module.forward
 
