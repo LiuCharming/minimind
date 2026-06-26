@@ -474,7 +474,8 @@ if __name__ == "__main__":
         start_step = ckp_data.get('step', 0)
 
     if args.use_compile == 1:
-        model = torch.compile(model)
+        import torch._inductor.config as inductor_config; inductor_config.pattern_matcher = False
+        inductor_config.triton.cudagraphs = False; model = torch.compile(model, mode="reduce-overhead")
         Logger('torch.compile enabled')
         rollout_engine.update_policy(model)
     if dist.is_initialized():

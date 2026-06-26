@@ -416,7 +416,8 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
-        actor_model = torch.compile(actor_model)
+        import torch._inductor.config as inductor_config; inductor_config.pattern_matcher = False
+        inductor_config.triton.cudagraphs = False; actor_model = torch.compile(actor_model, mode="reduce-overhead")
         Logger('torch.compile enabled')
         rollout_engine.update_policy(actor_model)
     if dist.is_initialized():

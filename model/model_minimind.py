@@ -134,6 +134,7 @@ class Attention(nn.Module):
         # 2080 Ti / Turing 显卡专用: 使用 Triton 实现的 FlashAttentionV2 (比 PyTorch SDPA 更快)
         self.use_triton_flash = _FLASH_TRITON_AVAILABLE and config.flash_attn
 
+    @torch.compiler.disable
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
