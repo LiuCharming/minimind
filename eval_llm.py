@@ -24,16 +24,22 @@ def init_model(args):
             moh_shared_heads=args.moh_shared_heads,
             moh_routed_head=args.moh_routed_head,
             num_attention_heads=args.num_attention_heads,
-            inference_rope_scaling=args.inference_rope_scaling
+            inference_rope_scaling=args.inference_rope_scaling,
+            use_fff=bool(args.use_fff),
+            fff_depth=args.fff_depth,
+            fff_leaf_width=args.fff_leaf_width,
+            fff_dropout=args.fff_dropout
         ))
         moe_suffix = '_moe' if args.use_moe else ''
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        fff_suffix = '_fff' if args.use_fff else ''
+        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}{fff_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         if args.lora_weight != 'None':
             apply_lora(model, target_modules=['attention'])
             moe_suffix = '_moe' if args.use_moe else ''
             moh_suffix = '_moh' if args.use_moh else ''
-            load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}{moh_suffix}.pth')
+            fff_suffix = '_fff' if args.use_fff else ''
+            load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}{moh_suffix}{fff_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
@@ -64,6 +70,10 @@ def main():
     parser.add_argument('--moh_shared_heads', default=4, type=int, help="MoH始终激活的Q头数")
     parser.add_argument('--moh_routed_head', default=1, type=int, help="MoH每个token激活的专家Q头数(top-k)")
     parser.add_argument('--num_attention_heads', default=8, type=int, help="Q头总数（需为KV头数的整数倍）")
+    parser.add_argument('--use_fff', default=0, type=int, choices=[0, 1], help="使用FFF(Fast Feedforward Network)替代标准FFN")
+    parser.add_argument('--fff_depth', default=3, type=int, help="FFF树深度 (2^depth个叶子)")
+    parser.add_argument('--fff_leaf_width', default=384, type=int, help="FFF叶子中间维度")
+    parser.add_argument('--fff_dropout', default=0.0, type=float, help="FFF叶子dropout")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     
