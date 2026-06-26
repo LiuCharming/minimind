@@ -2,7 +2,7 @@ import os
 import sys
 
 __package__ = "trainer"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
 import argparse
@@ -64,7 +64,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            fff_suffix = '_fff' if lm_config.use_fff else ''
+            sharedffn_suffix = '_sharedffn' if lm_config.use_shared_ffn else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}{fff_suffix}{sharedffn_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
@@ -105,6 +107,11 @@ if __name__ == "__main__":
     parser.add_argument('--num_experts', default=4, type=int, help="专家数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token激活的专家数")
     parser.add_argument('--moe_expert_intermediate_ratio', default=0.5, type=float, help="V2专家FFN宽度比例 (1.0=全尺寸, 0.5=半宽)")
+    parser.add_argument('--use_fff', default=0, type=int, choices=[0, 1], help="使用FFF(Fast Feedforward Network)替代标准FFN")
+    parser.add_argument('--fff_depth', default=3, type=int, help="FFF树深度 (2^depth个叶子)")
+    parser.add_argument('--fff_leaf_width', default=384, type=int, help="FFF叶子中间维度")
+    parser.add_argument('--fff_dropout', default=0.0, type=float, help="FFF叶子dropout")
+    parser.add_argument('--use_shared_ffn', default=0, type=int, choices=[0, 1], help="使用Shared FFN (ALBERT风格: 所有层共享同一个FFN权重)")
     parser.add_argument('--use_moh', default=0, type=int, choices=[0, 1], help="是否使用MoH(Mixture-of-Heads)注意力路由")
     parser.add_argument('--moh_shared_heads', default=4, type=int, help="MoH始终激活的Q头数")
     parser.add_argument('--moh_routed_head', default=1, type=int, help="MoH每个token激活的专家Q头数(top-k)")
@@ -114,6 +121,7 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
+    parser.add_argument("--flash_attn", default=1, type=int, choices=[0, 1], help="使用FlashAttention加速（0=禁用, 1=启用; Turing显卡建议0）")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
@@ -129,7 +137,11 @@ if __name__ == "__main__":
                                moe_expert_intermediate_ratio=args.moe_expert_intermediate_ratio,
                                use_moh=bool(args.use_moh), moh_shared_heads=args.moh_shared_heads,
                                moh_routed_head=args.moh_routed_head,
-                               num_attention_heads=args.num_attention_heads)
+                               num_attention_heads=args.num_attention_heads,
+                               use_fff=bool(args.use_fff), fff_depth=args.fff_depth,
+                               fff_leaf_width=args.fff_leaf_width, fff_dropout=args.fff_dropout,
+                               use_shared_ffn=bool(args.use_shared_ffn),
+                               flash_attn=bool(args.flash_attn))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========

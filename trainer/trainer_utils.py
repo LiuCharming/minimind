@@ -14,7 +14,7 @@ def _resolve_path(path: str) -> str:
         return os.path.normpath(os.path.join(_PROJECT_ROOT, path[3:]))
     return path
 __package__ = "trainer"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
 import math
 import numpy as np
@@ -79,15 +79,15 @@ def get_supported_dtype(requested_dtype="bfloat16", device_type="cuda"):
     在不支持的GPU上自动回退并给出提示。
     """
     if device_type != "cuda" or not torch.cuda.is_available():
-        Logger("⚠️ 未检测到 CUDA 设备，使用 float32")
+        Logger("[WARN] 未检测到 CUDA 设备，使用 float32")
         return torch.float32
     if requested_dtype == "bfloat16":
         major, _ = torch.cuda.get_device_capability()
         if major < 8:
-            Logger(f"⚠️ 当前 GPU (SM {major}.x, 如 2080 Ti) 不支持 bfloat16，自动回退到 float16")
+            Logger(f"[WARN] 当前 GPU (SM {major}.x, 如 2080 Ti) 不支持 bfloat16，自动回退到 float16")
             Logger(f"   (训练时可添加 --dtype float16 消除此提示)")
             return torch.float16
-        Logger(f"✓ GPU (SM {major}.x) 支持 bfloat16")
+        Logger(f"[OK] GPU (SM {major}.x) 支持 bfloat16")
         return torch.bfloat16
     if requested_dtype == "float16":
         return torch.float16
@@ -98,8 +98,10 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     save_dir = _resolve_path(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
-    ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    fff_suffix = '_fff' if lm_config.use_fff else ''
+    sharedffn_suffix = '_sharedffn' if lm_config.use_shared_ffn else ''
+    ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}{fff_suffix}{sharedffn_suffix}.pth'
+    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}{fff_suffix}{sharedffn_suffix}_resume.pth'
 
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -157,7 +159,9 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{_resolve_path(save_dir)}//{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        fff_suffix = '_fff' if lm_config.use_fff else ''
+        sharedffn_suffix = '_sharedffn' if lm_config.use_shared_ffn else ''
+        weight_path = f'{_resolve_path(save_dir)}//{from_weight}_{lm_config.hidden_size}{moe_suffix}{fff_suffix}{sharedffn_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 

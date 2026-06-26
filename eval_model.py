@@ -14,6 +14,7 @@ MiniMind 模型综合性能评估
     python eval_model.py --weight pretrain --num_samples 200
     python eval_model.py --weight full_sft --use_moe 1 --moe_type v2 --num_experts 12 --num_experts_per_tok 2
     python eval_model.py --weight pretrain --use_moh 1 --num_attention_heads 12 --moh_shared_heads 6 --moh_routed_head 2
+    python eval_model.py --weight pretrain_sharedffn --use_shared_ffn 1
 """
 
 import os, sys, time, math, json, argparse, warnings
@@ -42,13 +43,22 @@ def init_model(args):
         moh_routed_head=args.moh_routed_head,
         num_attention_heads=args.num_attention_heads,
         inference_rope_scaling=args.inference_rope_scaling,
+        use_fff=bool(args.use_fff),
+        fff_depth=args.fff_depth,
+        fff_leaf_width=args.fff_leaf_width,
+        fff_dropout=args.fff_dropout,
+        use_shared_ffn=bool(args.use_shared_ffn),
     )
     moe_suffix = '_moe' if args.use_moe else ''
+    fff_suffix = '_fff' if args.use_fff else ''
+    sharedffn_suffix = '_sharedffn' if args.use_shared_ffn else ''
     project_root = os.path.dirname(os.path.abspath(__file__))
-    ckp = os.path.join(project_root, args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}.pth')
+    ckp = os.path.join(project_root, args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}{fff_suffix}{sharedffn_suffix}.pth')
     model = MiniMindForCausalLM(config)
-    model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
-    model = model.half().eval().to(args.device)
+    state_dict = torch.load(ckp, map_location=args.device)
+    model.load_state_dict(state_dict, strict=True)
+    # 训练时已存为 float16, 直接加载即可
+    model = model.eval().to(args.device)
     return model, tokenizer
 
 
@@ -244,7 +254,7 @@ def compute_param_stats(model):
     has_nan = any(torch.any(torch.isnan(p.data)) for p in model.parameters())
     has_inf = any(torch.any(torch.isinf(p.data)) for p in model.parameters())
     if has_nan or has_inf:
-        print(f"\n  ⚠️  NaN: {has_nan}, Inf: {has_inf}")
+        print(f"\n  [WARN] NaN: {has_nan}, Inf: {has_inf}")
 
     return stats
 
@@ -291,7 +301,7 @@ def compute_attention_stats(model, tokenizer, device, seq_len=128):
             first_attn = layer.self_attn
 
     if first_attn is None:
-        print("  ⚠️ 未找到 attention 模块")
+        print("  [WARN] 未找到 attention 模块")
         return {}
 
     # 手动计算 attention (取第一层采样)
@@ -559,6 +569,13 @@ if __name__ == "__main__":
     parser.add_argument('--moh_shared_heads', default=4, type=int)
     parser.add_argument('--moh_routed_head', default=1, type=int)
     parser.add_argument('--num_attention_heads', default=8, type=int)
+    # FFF (Fast Feedforward Network)
+    parser.add_argument('--use_fff', default=0, type=int, choices=[0, 1])
+    parser.add_argument('--fff_depth', default=3, type=int)
+    parser.add_argument('--fff_leaf_width', default=384, type=int)
+    parser.add_argument('--fff_dropout', default=0.0, type=float)
+    # Shared FFN (ALBERT-style)
+    parser.add_argument('--use_shared_ffn', default=0, type=int, choices=[0, 1], help="使用Shared FFN (ALBERT风格: 所有层共享同一个FFN权重)")
     # 评估
     parser.add_argument('--num_samples', default=200, type=int, help="PPL 评估样本数")
     parser.add_argument('--data_path', default=None, type=str, help="验证数据路径(默认=pretrain数据)")
@@ -580,6 +597,10 @@ if __name__ == "__main__":
         print(f"║  MoE: {args.moe_type} | Experts: {args.num_experts} | Top-K: {args.num_experts_per_tok}")
     if args.use_moh:
         print(f"║  MoH: {args.num_attention_heads} heads | Shared: {args.moh_shared_heads} | Top-K: {args.moh_routed_head}")
+    if args.use_fff:
+        print(f"║  FFF: depth={args.fff_depth} | leaves={2**args.fff_depth} | leaf_width={args.fff_leaf_width}")
+    if args.use_shared_ffn:
+        print(f"║  Shared FFN: all {args.num_hidden_layers} layers share 1 FFN (~{args.hidden_size} hidden)")
     print("╚" + "═" * 58 + "╝")
 
     model, tokenizer = init_model(args)

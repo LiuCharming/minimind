@@ -28,12 +28,16 @@ def init_model(args):
             use_fff=bool(args.use_fff),
             fff_depth=args.fff_depth,
             fff_leaf_width=args.fff_leaf_width,
-            fff_dropout=args.fff_dropout
+            fff_dropout=args.fff_dropout,
+            use_shared_ffn=bool(args.use_shared_ffn)
         ))
         moe_suffix = '_moe' if args.use_moe else ''
         fff_suffix = '_fff' if args.use_fff else ''
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}{fff_suffix}.pth'
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        sharedffn_suffix = '_sharedffn' if args.use_shared_ffn else ''
+        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}{fff_suffix}{sharedffn_suffix}.pth'
+        # 训练时已存为 float16, 直接加载即可, 不再调 .half() (避免 Embedding 输出 dtype 不一致)
+        state_dict = torch.load(ckp, map_location='cpu')
+        model.load_state_dict(state_dict, strict=True)
         if args.lora_weight != 'None':
             apply_lora(model, target_modules=['attention'])
             moe_suffix = '_moe' if args.use_moe else ''
@@ -43,7 +47,7 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
-    return model.half().eval().to(args.device), tokenizer
+    return model.eval().to(args.device), tokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
@@ -74,6 +78,7 @@ def main():
     parser.add_argument('--fff_depth', default=3, type=int, help="FFF树深度 (2^depth个叶子)")
     parser.add_argument('--fff_leaf_width', default=384, type=int, help="FFF叶子中间维度")
     parser.add_argument('--fff_dropout', default=0.0, type=float, help="FFF叶子dropout")
+    parser.add_argument('--use_shared_ffn', default=0, type=int, choices=[0, 1], help="使用Shared FFN (ALBERT风格: 所有层共享同一个FFN权重)")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     

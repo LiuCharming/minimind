@@ -11,7 +11,25 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 _FLASH_TRITON_AVAILABLE = False
 try:
     from flash_attention_triton import flash_attention_v2
-    _FLASH_TRITON_AVAILABLE = True
+    # GPU SM check: Turing (SM 7.x) has 64KB shared mem, Triton needs ~72KB
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability(0)[0]
+        if major >= 8:
+            _FLASH_TRITON_AVAILABLE = True
+    else:
+        _FLASH_TRITON_AVAILABLE = True  # CPU mode
+except ImportError:
+    pass
+
+# ══════════════════════════════════════════════════════════════
+#  可选: fastfeedforward (FFF) — 快速树形前馈网络
+#  论文: "Fast Feedforward Networks" (https://arxiv.org/abs/2308.14711)
+#  如果未安装, 自动回退到标准 SwiGLU FFN
+# ══════════════════════════════════════════════════════════════
+_FFF_AVAILABLE = False
+try:
+    from fastfeedforward import FFF as _FFF
+    _FFF_AVAILABLE = True
 except ImportError:
     pass
 
@@ -67,6 +85,16 @@ class MiniMindConfig(PretrainedConfig):
         self.moh_shared_heads = kwargs.get("moh_shared_heads", 4)
         self.moh_routed_head = kwargs.get("moh_routed_head", 1)
         self.moh_balance_loss_weight = kwargs.get("moh_balance_loss_weight", 0.01)
+        # Shared FFN (ALBERT-style: all layers share the same FFN weights)
+        self.use_shared_ffn = kwargs.get("use_shared_ffn", False)
+        # FFF (Fast Feedforward Network) config
+        self.use_fff = kwargs.get("use_fff", False)           # 是否用FFF替代标准FFN
+        self.fff_depth = kwargs.get("fff_depth", 3)            # FFF树深度 → 2^depth个叶子
+        self.fff_leaf_width = kwargs.get("fff_leaf_width",
+            math.ceil(self.intermediate_size * 0.5 / 64) * 64) # 每个叶子的中间维度
+        self.fff_dropout = kwargs.get("fff_dropout", 0.0)      # FFF叶子dropout
+        self.fff_train_hardened = kwargs.get("fff_train_hardened", False)  # 训练时是否硬化决策
+
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -201,6 +229,101 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+
+class FFFFeedForward(nn.Module):
+    """
+    Fast Feedforward Network (FFF)
+    
+    train: uses fastfeedforward library's training_forward (soft decisions)
+    eval:  uses batched path -- groups tokens by leaf for efficient matmuls
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        if not _FFF_AVAILABLE:
+            raise ImportError(
+                "fastfeedforward not installed! pip install fastfeedforward"
+            )
+
+        if config.hidden_act == 'silu':
+            activation = nn.SiLU()
+        elif config.hidden_act == 'gelu':
+            activation = nn.GELU()
+        elif config.hidden_act == 'relu':
+            activation = nn.ReLU()
+        else:
+            activation = nn.SiLU()
+
+        self.fff = _FFF(
+            input_width=config.hidden_size,
+            leaf_width=config.fff_leaf_width,
+            output_width=config.hidden_size,
+            depth=config.fff_depth,
+            activation=activation,
+            dropout=config.fff_dropout,
+            train_hardened=config.fff_train_hardened,
+            region_leak=0.0,
+            usage_mode='none',
+        )
+
+        self.aux_loss = torch.zeros(1).squeeze()
+
+    def forward(self, x):
+        if self.training:
+            return self.fff(x)
+        else:
+            return self._eval_forward_batched(x)
+
+    def _eval_forward_batched(self, x):
+        """Batched eval: tree routing + leaf-grouped matmuls.
+        Avoids the per-token Python for-loop in the library's eval_forward."""
+        fff = self.fff
+        original_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        batch_size = x_flat.shape[0]
+        device = x_flat.device
+        dtype = x_flat.dtype
+
+        depth = fff.depth.item()
+        n_leaves = fff.n_leaves
+
+        # Stage 1: tree routing (fully vectorized)
+        current_nodes = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        for i in range(depth):
+            plane_coeffs = fff.node_weights.index_select(dim=0, index=current_nodes)
+            plane_offsets = fff.node_biases.index_select(dim=0, index=current_nodes)
+            plane_score = torch.bmm(
+                x_flat.unsqueeze(1), plane_coeffs.unsqueeze(-1)
+            ).squeeze(-1) + plane_offsets
+            plane_choices = (plane_score.squeeze(-1) >= 0).long()
+            platform = 2 ** i - 1
+            next_platform = 2 ** (i + 1) - 1
+            current_nodes = (current_nodes - platform) * 2 + plane_choices + next_platform
+        leaves = current_nodes - (2 ** depth - 1)
+
+        # Stage 2: group tokens by leaf, batch matmul
+        output = torch.zeros((batch_size, fff.output_width), dtype=dtype, device=device)
+        for leaf_idx in range(n_leaves):
+            mask = (leaves == leaf_idx)
+            if not mask.any():
+                continue
+            leaf_x = x_flat[mask]
+            h = torch.matmul(leaf_x, fff.w1s[leaf_idx]) + fff.b1s[leaf_idx]
+            h = fff.activation(h)
+            output[mask] = torch.matmul(h, fff.w2s[leaf_idx]) + fff.b2s[leaf_idx]
+
+        return output.view(*original_shape[:-1], fff.output_width)
+
+    @property
+    def n_leaves(self):
+        return 2 ** self.fff.depth.item()
+
+    @property
+    def n_nodes(self):
+        return self.n_leaves - 1
+
+
+
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -293,8 +416,21 @@ class MOEFeedForwardV2(nn.Module):
         return (self._expert_util_sum / self._expert_util_cnt).cpu()
 
 
+# ─── MLP factory: 根据 config 创建正确的 MLP ───
+def _create_mlp(config: MiniMindConfig):
+    """Create the appropriate MLP module based on config flags."""
+    if config.use_fff:
+        return FFFFeedForward(config)
+    elif not config.use_moe:
+        return FeedForward(config)
+    elif config.moe_type == "v2":
+        return MOEFeedForwardV2(config)
+    else:
+        return MOEFeedForward(config)
+
+
 class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+    def __init__(self, layer_id: int, config: MiniMindConfig, shared_mlp=None):
         super().__init__()
         if config.use_moh:
             from model.moh import MoHAttention
@@ -314,12 +450,12 @@ class MiniMindBlock(nn.Module):
             self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if not config.use_moe:
-            self.mlp = FeedForward(config)
-        elif config.moe_type == "v2":
-            self.mlp = MOEFeedForwardV2(config)
+
+        # ── MLP: 如果传入了 shared_mlp, 直接引用 (Shared FFN) ──
+        if shared_mlp is not None:
+            self.mlp = shared_mlp
         else:
-            self.mlp = MOEFeedForward(config)
+            self.mlp = _create_mlp(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -338,7 +474,19 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+
+        # ── Shared FFN: 所有层共享同一个 MLP 实例 ──
+        if config.use_shared_ffn:
+            shared_mlp = _create_mlp(config)
+            self.layers = nn.ModuleList([
+                MiniMindBlock(l, config, shared_mlp=shared_mlp)
+                for l in range(self.num_hidden_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                MiniMindBlock(l, config) for l in range(self.num_hidden_layers)
+            ])
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
@@ -350,6 +498,10 @@ class MiniMindModel(nn.Module):
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # ensure dtype match model params
+        model_dtype = self.embed_tokens.weight.dtype
+        if hidden_states.dtype != model_dtype:
+            hidden_states = hidden_states.to(model_dtype)
         # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
@@ -427,7 +579,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 if s is not None:
                     stats[i] = s
         return stats
-    
+
     # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
@@ -444,7 +596,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            if top_k > 0: 
+            if top_k > 0:
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
