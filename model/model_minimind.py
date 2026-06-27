@@ -451,7 +451,7 @@ class MiniMindBlock(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # ── MLP: 如果传入了 shared_mlp, 直接引用 (Shared FFN) ──
+        # ── MLP: 如果传入了 shared_mlp, 直接引用 (Shared FFN / Shared MoE) ──
         if shared_mlp is not None:
             self.mlp = shared_mlp
         else:
@@ -475,7 +475,7 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
 
-        # ── Shared FFN: 所有层共享同一个 MLP 实例 ──
+        # ── Shared FFN: 所有层共享同一个 MLP 实例 (支持 MoE v1/v2 + FFF) ──
         if config.use_shared_ffn:
             shared_mlp = _create_mlp(config)
             self.layers = nn.ModuleList([
@@ -518,7 +518,17 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, (MOEFeedForward, MOEFeedForwardV2))], hidden_states.new_zeros(1).squeeze())
+
+        # ── aux_loss: dedup by id() (Shared FFN/MoE 场景下同一个 MLP 被多个 layer 引用) ──
+        seen_mlp_ids = set()
+        aux_loss = hidden_states.new_zeros(1).squeeze()
+        for l in self.layers:
+            if isinstance(l.mlp, (MOEFeedForward, MOEFeedForwardV2)):
+                mlp_id = id(l.mlp)
+                if mlp_id not in seen_mlp_ids:
+                    seen_mlp_ids.add(mlp_id)
+                    aux_loss = aux_loss + l.mlp.aux_loss
+
         # 如果使用 MoH，也收集 attention 的负载均衡损失
         from model.moh import MoHAttention
         moh_aux = sum([l.self_attn.aux_loss for l in self.layers if isinstance(l.self_attn, MoHAttention)], hidden_states.new_zeros(1).squeeze())
@@ -547,19 +557,29 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
 
     def reset_moe_stats(self):
-        """重置所有 V2 MoE 层 + MoH 层的利用率统计"""
+        """重置所有 V2 MoE 层的利用率统计 (Shared FFN 场景下自动去重)"""
+        seen = set()
         for layer in self.model.layers:
             if isinstance(layer.mlp, MOEFeedForwardV2):
-                layer.mlp.reset_moe_stats()
+                mlp_id = id(layer.mlp)
+                if mlp_id not in seen:
+                    seen.add(mlp_id)
+                    layer.mlp.reset_moe_stats()
 
     def get_moe_stats(self):
-        """返回每层专家利用率 {layer_id: tensor[num_experts]}"""
+        """返回各层专家利用率 {layer_id: tensor[num_experts]} (Shared FFN 场景下自动去重)"""
         stats = {}
+        seen = set()
         for i, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, MOEFeedForwardV2):
-                s = layer.mlp.get_moe_stats()
-                if s is not None:
-                    stats[i] = s
+                mlp_id = id(layer.mlp)
+                if mlp_id not in seen:
+                    seen.add(mlp_id)
+                    s = layer.mlp.get_moe_stats()
+                    if s is not None:
+                        # Shared MoE: 所有层共享同一个 MLP，标注为 'shared'
+                        label = 'shared' if self.config.use_shared_ffn else i
+                        stats[label] = s
         return stats
 
     def reset_moh_stats(self):
